@@ -63,7 +63,7 @@ class HandTracker:
         
         # Data collection limits
         self.sample_count = 0
-        self.max_samples = 60000  # Stop after 60,000 samples
+        self.max_samples = 30000  # Stop after 30,000 samples (30 seconds at 1kHz)
         
         # Threading for continuous EMG monitoring
         self.emg_thread = None
@@ -79,12 +79,13 @@ class HandTracker:
             'D7': 0    # Detail coefficient (250-500Hz)
         }
         
-        # Delay mechanism for logging
-        self.logging_delay_samples = 3000  # Wait for 3,000 samples before logging
-        self.logging_delay_time = 3.0      # Wait for 3 seconds before logging
-        self.logging_started = False       # Flag to track if logging has begun
+        # Hand tracking validation
+        self.hand_lost_frames = 0
+        self.max_lost_frames = 10  # Cancel recording after 10 consecutive frames without hand detection
+        
+        # Logging control (no delay - start immediately)
+        self.logging_started = True        # Start logging immediately
         self.recording_start_time = None   # Time when recording started
-        self.pre_logging_sample_count = 0  # Sample count before logging begins
         
         # Ensure datasets directory exists
         if not os.path.exists(self.datasets_dir):
@@ -95,28 +96,24 @@ class HandTracker:
         
         # Plotting functionality removed - simple camera and data collection only
     
-    def get_delay_status(self):
+    def get_recording_status(self):
         """
-        Get current delay status information.
+        Get current recording status information.
         
         Returns:
-            Dictionary with delay status information
+            Dictionary with recording status information
         """
-        if not self.recording or self.logging_started:
+        if not self.recording:
             return None
         
-        elapsed_time = time.time() - self.recording_start_time
-        sample_progress = self.pre_logging_sample_count / self.logging_delay_samples
-        time_progress = elapsed_time / self.logging_delay_time
+        elapsed_time = time.time() - self.recording_start_time if self.recording_start_time else 0
+        progress = self.sample_count / self.max_samples if self.max_samples > 0 else 0
         
         return {
-            'samples_collected': self.pre_logging_sample_count,
-            'samples_needed': self.logging_delay_samples,
+            'samples_collected': self.sample_count,
+            'samples_target': self.max_samples,
             'time_elapsed': elapsed_time,
-            'time_needed': self.logging_delay_time,
-            'sample_progress': sample_progress,
-            'time_progress': time_progress,
-            'overall_progress': min(sample_progress, time_progress)
+            'progress': progress
         }
     
     def init_serial(self):
@@ -259,9 +256,9 @@ class HandTracker:
         
         return angles
     
-    def draw_hand_info(self, frame, hand_landmarks, angles):
+    def draw_index_finger_only(self, frame, hand_landmarks, angles):
         """
-        Draw hand landmarks and angle information on frame.
+        Draw only index finger landmarks, connections, and angle information.
         
         Args:
             frame: Input frame
@@ -270,11 +267,19 @@ class HandTracker:
         """
         h, w, _ = frame.shape
         
-        # Draw index finger landmarks
-        for landmark_id in self.index_finger_landmarks:
+        # Draw index finger landmarks with different colors for each joint
+        landmark_colors = [
+            (0, 255, 255),  # TIP - Yellow
+            (0, 255, 0),    # DIP - Green  
+            (255, 0, 0),    # PIP - Blue
+            (0, 0, 255)     # MCP - Red
+        ]
+        
+        for i, landmark_id in enumerate(self.index_finger_landmarks):
             landmark = hand_landmarks.landmark[landmark_id]
             x, y = int(landmark.x * w), int(landmark.y * h)
-            cv2.circle(frame, (x, y), 5, (0, 255, 0), -1)
+            cv2.circle(frame, (x, y), 6, landmark_colors[i], -1)
+            cv2.circle(frame, (x, y), 8, (255, 255, 255), 2)  # White border
         
         # Draw connections between index finger joints
         for i in range(len(self.index_finger_landmarks) - 1):
@@ -284,17 +289,61 @@ class HandTracker:
             x1, y1 = int(landmark1.x * w), int(landmark1.y * h)
             x2, y2 = int(landmark2.x * w), int(landmark2.y * h)
             
-            cv2.line(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+            cv2.line(frame, (x1, y1), (x2, y2), (255, 255, 255), 3)  # White connections
         
-        # Draw angle annotations
+        # Draw angle annotations with better positioning
+        joint_names = ["TIP-DIP", "DIP-PIP"]
         for i, angle in enumerate(angles):
             if i < len(self.index_finger_landmarks) - 2:
                 landmark = hand_landmarks.landmark[self.index_finger_landmarks[i + 1]]
                 x, y = int(landmark.x * w), int(landmark.y * h)
                 
-                # Draw angle text
-                cv2.putText(frame, f"{angle:.1f} degs", (x + 10, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                # Position text to avoid overlap
+                text_x = x + 15
+                text_y = y - 10 - (i * 25)  # Offset each angle text
+                
+                # Draw angle text with background for better readability
+                text = f"{joint_names[i]}: {angle:.1f}°"
+                text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+                cv2.rectangle(frame, (text_x - 2, text_y - text_size[1] - 2), 
+                             (text_x + text_size[0] + 2, text_y + 2), (0, 0, 0), -1)
+                cv2.putText(frame, text, (text_x, text_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+    
+    def check_and_cancel_recording(self, frame, reason):
+        """
+        Check if recording should be cancelled due to hand loss.
+        
+        Args:
+            frame: Current frame for displaying warning
+            reason: Reason for potential cancellation
+        """
+        # Display warning on frame
+        warning_text = f"WARNING: {reason}"
+        cv2.putText(frame, warning_text, (10, 90), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        
+        lost_count_text = f"Lost frames: {self.hand_lost_frames}/{self.max_lost_frames}"
+        cv2.putText(frame, lost_count_text, (10, 120), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+        
+        # Cancel recording if too many frames lost
+        if self.hand_lost_frames >= self.max_lost_frames:
+            print(f"\n[WARNING] Recording cancelled: {reason}")
+            print(f"[INFO] Hand tracking lost for {self.hand_lost_frames} consecutive frames")
+            print(f"[INFO] Collected {self.sample_count:,} samples before cancellation")
+            
+            # Stop recording
+            self.recording = False
+            self.stop_csv_recording()
+            
+            # Reset counters
+            self.hand_lost_frames = 0
+            
+            # Display cancellation message on frame
+            cancel_text = "RECORDING CANCELLED - Hand Lost"
+            cv2.putText(frame, cancel_text, (10, 150), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 3)
     
     def process_frame(self, frame):
         """
@@ -317,35 +366,56 @@ class HandTracker:
         frame = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
         
         if results.multi_hand_landmarks:
+            # Hand detected - reset lost frame counter
+            self.hand_lost_frames = 0
+            
             for hand_landmarks in results.multi_hand_landmarks:
                 # Calculate index finger angles
                 angles = self.get_index_finger_angles(
                     hand_landmarks, frame.shape[1], frame.shape[0]
                 )
                 
-                # Draw hand landmarks (optimized - only when needed)
-                self.mp_drawing.draw_landmarks(
-                    frame,
-                    hand_landmarks,
-                    self.mp_hands.HAND_CONNECTIONS,
-                    self.mp_drawing_styles.get_default_hand_landmarks_style(),
-                    self.mp_drawing_styles.get_default_hand_connections_style()
-                )
-                
-                # Draw hand info and angles
-                self.draw_hand_info(frame, hand_landmarks, angles)
-                
-                # Display angle information (optimized text rendering)
-                if angles:
+                # Validate that we have valid angles
+                if angles and len(angles) >= 2:
+                    # Draw only index finger landmarks and connections
+                    self.draw_index_finger_only(frame, hand_landmarks, angles)
+                    
+                    # Display angle information (optimized text rendering)
                     angle_text = f"Angles: {angles[0]:.0f}°, {angles[1]:.0f}°"
                     cv2.putText(frame, angle_text, (10, 30), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                
-                # Update angle data and set flag for EMG-driven collection
-                if angles:
+                    
+                    # Update angle data and set flag for EMG-driven collection
                     self.latest_angles = angles
                     self.latest_timestamp = time.time()
                     self.new_angle_flag = True
+                    
+                    # Show recording status
+                    if self.recording:
+                        status_text = "RECORDING - Hand Tracked"
+                        cv2.putText(frame, status_text, (10, 60), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                else:
+                    # Invalid angles - treat as hand lost
+                    self.hand_lost_frames += 1
+                    if self.recording:
+                        self.check_and_cancel_recording(frame, "Invalid hand pose detected")
+        else:
+            # No hand detected
+            self.hand_lost_frames += 1
+            if self.recording:
+                self.check_and_cancel_recording(frame, "Hand lost from frame")
+            else:
+                # Show instruction when not recording
+                instruction_text = "Show your hand to start tracking"
+                cv2.putText(frame, instruction_text, (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        
+        # Always show recording controls
+        if not self.recording:
+            control_text = "Press 'r' to start recording | Press 'q' to quit"
+            cv2.putText(frame, control_text, (10, frame.shape[0] - 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
         return frame
     
@@ -368,9 +438,9 @@ class HandTracker:
         print("Hand Tracking with EMG-Driven Data Collection Started!")
         print("Show your hand to the camera.")
         print("Press 'r' in camera window to START data collection")
-        print("Data collection will automatically stop after 60,000 samples")
-        print("IMPORTANT: Logging begins after 3,000 samples OR 3 seconds (whichever comes first)")
-        print("This delay ensures stable sensor readings before data collection")
+        print("Data collection will automatically stop after 30,000 samples (30 seconds)")
+        print("Recording will CANCEL if hand is lost for more than 10 frames (~0.33s)")
+        print("Logging starts immediately when recording begins")
         print("Press 'q' to quit")
         print("Data format: timestamp,angle1,angle2,A11,D11,D10,D9,D8,D7")
         print("EMG sampling includes six wavelet coefficients (A11 + D11-D7)")
@@ -416,15 +486,8 @@ class HandTracker:
                     frame_time = (current_time - last_frame_time) * 1000  # Convert to ms
                     
                     if self.recording:
-                        if self.logging_started:
-                            sample_info = f", Samples: {self.sample_count:,}/{self.max_samples:,}"
-                        else:
-                            delay_status = self.get_delay_status()
-                            if delay_status:
-                                progress_pct = delay_status['overall_progress'] * 100
-                                sample_info = f", Delay: {progress_pct:.1f}% ({delay_status['samples_collected']}/{delay_status['samples_needed']} samples)"
-                            else:
-                                sample_info = ", Delay: Initializing..."
+                        progress_pct = (self.sample_count / self.max_samples) * 100 if self.max_samples > 0 else 0
+                        sample_info = f", Samples: {self.sample_count:,}/{self.max_samples:,} ({progress_pct:.1f}%)"
                     else:
                         sample_info = ""
                     
@@ -446,13 +509,14 @@ class HandTracker:
                     self.recording = True
                     self.sample_count = 0  # Reset sample counter
                     print("[INFO] Data collection STARTED")
-                    print(f"[INFO] Will automatically stop after {self.max_samples:,} samples")
-                    print(f"[INFO] Logging will begin after {self.logging_delay_samples:,} samples or {self.logging_delay_time} seconds")
+                    print(f"[INFO] Will automatically stop after {self.max_samples:,} samples (30 seconds)")
+                    print(f"[INFO] Logging starts immediately")
                     print(f"[DEBUG] Recording state set to: {self.recording}")
                     self.start_csv_recording()
                 elif key == ord('r') and self.recording:
                     # If already recording, show status
-                    print(f"[INFO] Already recording. Current samples: {self.sample_count:,}/{self.max_samples:,}")
+                    progress_pct = (self.sample_count / self.max_samples) * 100 if self.max_samples > 0 else 0
+                    print(f"[INFO] Already recording. Current samples: {self.sample_count:,}/{self.max_samples:,} ({progress_pct:.1f}%)")
                 
                 # Frame rate limiting to maintain 30 FPS
                 loop_time = time.time() - loop_start_time
@@ -503,12 +567,11 @@ class HandTracker:
         
         print(f"[INFO] Started recording to {csv_path}")
         print(f"[INFO] Recording format: timestamp,angle1,angle2,A11,D11,D10,D9,D8,D7")
-        print(f"[INFO] Logging will begin after {self.logging_delay_samples} samples or {self.logging_delay_time} seconds")
+        print(f"[INFO] Logging starts immediately")
         
-        # Initialize delay mechanism
+        # Initialize recording
         self.recording_start_time = time.time()  # Set recording start time
-        self.pre_logging_sample_count = 0       # Reset pre-logging sample count
-        self.logging_started = False            # Reset logging started flag
+        self.logging_started = True              # Start logging immediately
     
     def stop_csv_recording(self):
         """Stop recording and close the CSV file."""
@@ -538,31 +601,6 @@ class HandTracker:
         """
         while self.emg_running:
             if self.recording:
-                # Always process delay logic when recording, regardless of serial connection
-                if not self.logging_started:
-                    # Ensure recording_start_time is initialized
-                    if self.recording_start_time is None:
-                        self.recording_start_time = time.time()
-                        print(f"[DEBUG] Initialized recording_start_time: {self.recording_start_time}")
-                    
-                    current_time = time.time()
-                    elapsed_time = current_time - self.recording_start_time
-                    
-                    # Increment sample counter for delay (even without serial data)
-                    self.pre_logging_sample_count += 1
-                    
-                    # Debug: Show delay progress every 100 samples
-                    if self.pre_logging_sample_count % 100 == 0:
-                        progress_pct = min(self.pre_logging_sample_count / self.logging_delay_samples, 
-                                         elapsed_time / self.logging_delay_time) * 100
-                        print(f"[DEBUG] Delay progress: {progress_pct:.1f}% - Samples: {self.pre_logging_sample_count}/{self.logging_delay_samples}, Time: {elapsed_time:.1f}s/{self.logging_delay_time}s")
-                    
-                    # Check if delay conditions are met
-                    if self.pre_logging_sample_count >= self.logging_delay_samples or elapsed_time >= self.logging_delay_time:
-                        self.logging_started = True
-                        print(f"[INFO] Logging started after {self.pre_logging_sample_count} samples ({elapsed_time:.2f}s)")
-                        print(f"[INFO] Now collecting data for analysis...")
-                
                 # Try to get EMG data if serial connection exists
                 if self.serial_connection:
                     emg_data = self.parse_serial_packet()
@@ -572,32 +610,32 @@ class HandTracker:
                         # Store latest EMG data for potential future use
                         self.latest_emg_data = emg_data.copy()
                         
-                        # Only log data after delay period
-                        if self.logging_started:
-                            if self.new_angle_flag and self.latest_angles:
-                                # Pair EMG with latest angle data
-                                self.write_data_to_csv(timestamp, self.latest_angles, emg_data)
-                                self.new_angle_flag = False  # Reset flag after pairing
-                                
-                                # Print paired data with all coefficients
-                                print(f"{timestamp:.6f},{self.latest_angles[0]:.2f},{self.latest_angles[1]:.2f},{emg_data['A11']},{emg_data['D11']},{emg_data['D10']},{emg_data['D9']},{emg_data['D8']},{emg_data['D7']}")
-                            else:
-                                # Save EMG data without angle pairing
-                                self.write_data_to_csv(timestamp, None, emg_data)
-                                
-                                # Print EMG-only data with all coefficients
-                                print(f"{timestamp:.6f},0,0,{emg_data['A11']},{emg_data['D11']},{emg_data['D10']},{emg_data['D9']},{emg_data['D8']},{emg_data['D7']}")
+                        # Log data immediately (no delay)
+                        if self.new_angle_flag and self.latest_angles:
+                            # Pair EMG with latest angle data
+                            self.write_data_to_csv(timestamp, self.latest_angles, emg_data)
+                            self.new_angle_flag = False  # Reset flag after pairing
                             
-                            # Only increment sample counter after logging has started
-                            self.sample_count += 1
+                            # Print paired data with all coefficients
+                            print(f"{timestamp:.6f},{self.latest_angles[0]:.2f},{self.latest_angles[1]:.2f},{emg_data['A11']},{emg_data['D11']},{emg_data['D10']},{emg_data['D9']},{emg_data['D8']},{emg_data['D7']}")
+                        else:
+                            # Save EMG data without angle pairing
+                            self.write_data_to_csv(timestamp, None, emg_data)
                             
-                            # Check if we've reached the sample limit
-                            if self.sample_count >= self.max_samples:
-                                print(f"[INFO] Reached {self.max_samples:,} samples. Stopping data collection.")
-                                self.recording = False
-                                self.stop_csv_recording()
-                                print(f"[DEBUG] Recording stopped. Thread continues monitoring. Recording state: {self.recording}")
-                                # Don't break - just continue monitoring for next recording session
+                            # Print EMG-only data with all coefficients
+                            print(f"{timestamp:.6f},0,0,{emg_data['A11']},{emg_data['D11']},{emg_data['D10']},{emg_data['D9']},{emg_data['D8']},{emg_data['D7']}")
+                        
+                        # Increment sample counter
+                        self.sample_count += 1
+                        
+                        # Check if we've reached the sample limit
+                        if self.sample_count >= self.max_samples:
+                            elapsed_time = time.time() - self.recording_start_time if self.recording_start_time else 0
+                            print(f"[INFO] Reached {self.max_samples:,} samples ({elapsed_time:.1f}s). Stopping data collection.")
+                            self.recording = False
+                            self.stop_csv_recording()
+                            print(f"[DEBUG] Recording stopped. Thread continues monitoring. Recording state: {self.recording}")
+                            # Don't break - just continue monitoring for next recording session
             
             # Small delay to maintain ~1kHz sampling rate
             time.sleep(0.001)  # 1ms delay for 1kHz sampling
