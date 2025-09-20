@@ -47,6 +47,8 @@ class SerialBroker:
         # Statistics
         self.bytes_received = 0
         self.bytes_forwarded = 0
+        self.packets_received = 0
+        self.packets_dropped = 0
         self.start_time = time.time()
         
     def create_virtual_ports(self, count: int = 2) -> List[str]:
@@ -66,6 +68,11 @@ class SerialBroker:
                 self.virtual_masters.append(master)
                 
                 print(f"Virtual port {i+1}: {slave_path}")
+                
+                # Set master to non-blocking mode once at startup
+                import fcntl
+                flags = fcntl.fcntl(master, fcntl.F_GETFL)
+                fcntl.fcntl(master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
                 
                 # Close slave fd (clients will open it)
                 os.close(slave)
@@ -135,34 +142,36 @@ class SerialBroker:
                     break
             
             try:
-                # Read data from real serial port
+                # Read data from real serial port with larger buffer
                 if self.serial_conn.in_waiting > 0:
                     data = self.serial_conn.read(self.serial_conn.in_waiting)
                     if data:
                         self.bytes_received += len(data)
+                        # Estimate packet count (assuming 26 bytes per packet)
+                        self.packets_received += len(data) // 26
                         
                         # Forward data to all virtual ports simultaneously
+                        ports_successful = 0
                         for i, master_fd in enumerate(self.virtual_masters):
                             try:
-                                # Set the file descriptor to non-blocking mode
-                                import fcntl
-                                flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
-                                fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-                                
                                 bytes_written = os.write(master_fd, data)
                                 self.bytes_forwarded += bytes_written
                                 error_counts[i] = 0  # Reset error count on success
+                                ports_successful += 1
                                     
                             except (OSError, IOError) as e:
                                 error_counts[i] += 1
-                                # Only print error messages occasionally to avoid spam
+                                # Track dropped packets
                                 if error_counts[i] == 1:
                                     print(f"Virtual port {i+1} ({self.virtual_port_paths[i]}): No client connected")
                                 elif error_counts[i] % 1000 == 0:  # Print every 1000 errors
                                     print(f"Virtual port {i+1}: Still no client ({error_counts[i]} attempts)")
+                        
+                        # Track packets that couldn't be forwarded to any port
+                        if ports_successful == 0:
+                            self.packets_dropped += len(data) // 26
                 
-                # Small delay to prevent excessive CPU usage
-                time.sleep(0.001)  # 1ms delay for ~1kHz polling
+                # No sleep - run as fast as possible to avoid dropping data
                 
             except Exception as e:
                 if self.running:
@@ -183,11 +192,13 @@ class SerialBroker:
             if self.bytes_received > 0:
                 elapsed = time.time() - self.start_time
                 rate = self.bytes_received / elapsed if elapsed > 0 else 0
+                packet_rate = self.packets_received / elapsed if elapsed > 0 else 0
+                drop_rate = (self.packets_dropped / self.packets_received * 100) if self.packets_received > 0 else 0
                 
                 print(f"[STATS] Running for {elapsed:.1f}s | "
-                      f"Received: {self.bytes_received:,} bytes | "
-                      f"Forwarded: {self.bytes_forwarded:,} bytes | "
-                      f"Rate: {rate:.1f} bytes/sec")
+                      f"Packets: {self.packets_received:,} received, {self.packets_dropped:,} dropped ({drop_rate:.1f}%) | "
+                      f"Rate: {packet_rate:.1f} packets/sec | "
+                      f"Bytes: {self.bytes_received:,} received, {self.bytes_forwarded:,} forwarded")
     
     def start(self):
         """Start the broker."""
@@ -219,8 +230,8 @@ class SerialBroker:
         print("\nTo use the virtual ports, run these commands in separate terminals:")
         print("\n📊 SERIAL PLOTTER:")
         print(f"   python3 serial_plotter.py {virtual_paths[0]}")
-        print("\n📹 HAND TRACKING:")
-        print(f"   python3 hand_tracking.py {virtual_paths[1]}")
+        print("\n📹 LIVE VISUALIZER:")
+        print(f"   python3 live_visualizer.py {virtual_paths[1]}")
         
         print(f"\n🔄 The broker will forward all data from the real port to both virtual ports.")
         print(f"📡 Both scripts will receive identical real-time data streams.")
